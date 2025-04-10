@@ -286,7 +286,7 @@ def main(args: Namespace) -> None:
             dirpath=os.path.join(args.checkpoint_path, run_name),  # Define the path where checkpoints will be saved
             save_top_k=args.checkpoint_top_k,  # Set to -1 to save all epochs
             verbose=True,  # If you want to see a message for each checkpoint
-            monitor='loss',  # Quantity to monitor
+            monitor='val_loss',  # Quantity to monitor
             mode='min',  # Mode of the monitored quantity
             every_n_train_steps=args.checkpoint_every_n_examples//(args.batch_size * trainer.world_size),
         )

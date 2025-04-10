@@ -14,6 +14,7 @@ from pytorch_lightning.core import LightningModule
 from pytorch_lightning.trainer import Trainer
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
+from torchvision import transforms
 
 import logging
 import wandb
@@ -37,6 +38,7 @@ class LatentDownscaler(LightningModule):
                  val_url: str = None,
                  cosine_scheduler: bool = False,
                  max_steps: int = -1,
+                 use_resizing: bool = False,
                  **kwargs):
         super().__init__()
         self.save_hyperparameters()
@@ -58,7 +60,7 @@ class LatentDownscaler(LightningModule):
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.log_every_n_steps = log_every_n_steps
-        
+        self.use_resizing = use_resizing
         # Build the model
         self.build_model()
         
@@ -90,13 +92,17 @@ class LatentDownscaler(LightningModule):
         
     def forward(self, x):
         # Input: [B, C, 128, 128]
-        return self.model(x)
+        if self.use_resizing:
+            helper = transforms.Resize((x.shape[2]//2, x.shape[3]//2), interpolation=transforms.InterpolationMode.NEAREST_EXACT)
+            return self.model(x) + helper(x)
+        else:
+            return self.model(x)
 
     def training_step(self, batch, batch_idx):
         large_latents, small_latents = batch
         # Forward pass
         predicted_small_latents = self(large_latents)
-        
+
         # Calculate loss (MSE)
         loss = F.mse_loss(predicted_small_latents, small_latents)
         
@@ -237,7 +243,7 @@ def main(args: Namespace) -> None:
             dirpath=os.path.join(args.checkpoint_path, run_name),  # Define the path where checkpoints will be saved
             save_top_k=args.checkpoint_top_k,  # Set to -1 to save all epochs
             verbose=True,  # If you want to see a message for each checkpoint
-            monitor='loss',  # Quantity to monitor
+            monitor='val_loss',  # Quantity to monitor
             mode='min',  # Mode of the monitored quantity
             every_n_train_steps=args.checkpoint_every_n_examples//(args.batch_size * trainer.world_size),
         )
@@ -292,6 +298,7 @@ if __name__ == '__main__':
     # logging parameters
     parser.add_argument("--wandb_project", type=str, default="latent_downscaler")
     parser.add_argument("--wandb_dir", type=str, default=".")
+    parser.add_argument("--use_resizing", default=False, action="store_true")
     
     hparams = parser.parse_args()
 
