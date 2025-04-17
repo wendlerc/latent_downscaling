@@ -13,13 +13,102 @@ import webdataset as wds
 from pytorch_lightning.core import LightningModule
 from pytorch_lightning.trainer import Trainer
 from pytorch_lightning.loggers import WandbLogger
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from torchvision import transforms
 
 import logging
 import wandb
 import json
 
+from muon import Muon
+from torch import nn
+
+
+class AttentionBlock(nn.Module):
+    def __init__(self, in_channels, patch_size=8, num_heads=16):
+        super(AttentionBlock, self).__init__()
+        self.patch_size = patch_size
+        self.patch_embed = nn.Conv2d(in_channels, in_channels, kernel_size=patch_size, stride=patch_size)
+        self.patch_unembed = nn.Conv2d(in_channels, patch_size**2 * in_channels, kernel_size=1)
+        self.qkv = nn.Conv2d(in_channels, 3 * in_channels, kernel_size=1)
+        self.pos = nn.Parameter(torch.zeros(1, in_channels, 64//patch_size, 64//patch_size))
+        self.num_heads = num_heads
+        self.dim_heads = in_channels // num_heads
+        self.in_channels = in_channels
+    
+    def forward(self, x):
+        # make patches
+        patches = self.patch_embed(x) + self.pos
+        # turn patches into q, k, v
+        qkv = self.qkv(patches)
+        q, k, v = qkv.chunk(3, dim=1)
+        q = q.reshape(x.shape[0], self.num_heads, -1, patches.shape[2]*patches.shape[3], self.dim_heads)
+        k = k.reshape(x.shape[0], self.num_heads, -1, patches.shape[2]*patches.shape[3], self.dim_heads)
+        v = v.reshape(x.shape[0], self.num_heads, -1, patches.shape[2]*patches.shape[3], self.dim_heads)
+        mixed = nn.functional.scaled_dot_product_attention(q, k, v)
+        # turn patches back into feature map
+        mixed = mixed.reshape(x.shape[0], self.in_channels, patches.shape[2], patches.shape[3])
+        feature_map_ = self.patch_unembed(mixed) # this has too many channels--> reshape those into patches
+        feature_map = feature_map_.reshape(x.shape[0], -1, x.shape[2], x.shape[3])
+        return feature_map + x
+
+class SimpleResnetBlock2D(nn.Module):
+    def __init__(self, in_channels):
+        super(SimpleResnetBlock2D, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        return x + self.conv1(x)
+
+
+class ResnetBlock2D(nn.Module):
+    def __init__(self, in_channels, out_channels, conv_shortcut=True):
+        super(ResnetBlock2D, self).__init__()
+        self.norm1 = nn.GroupNorm(32, in_channels, eps=1e-05, affine=True)
+        self.conv1 = nn.Conv2d(
+            in_channels, out_channels, kernel_size=3, stride=1, padding=1
+        )
+        self.norm2 = nn.GroupNorm(32, out_channels, eps=1e-05, affine=True)
+        self.dropout = nn.Dropout(p=0.0, inplace=False)
+        self.conv2 = nn.Conv2d(
+            out_channels, out_channels, kernel_size=3, stride=1, padding=1
+        )
+        self.nonlinearity = nn.SiLU()
+        self.conv_shortcut = None
+        if conv_shortcut:
+            self.conv_shortcut = nn.Conv2d(
+                in_channels, out_channels, kernel_size=1, stride=1
+            )
+
+    def forward(self, input_tensor):
+        hidden_states = input_tensor
+        hidden_states = self.norm1(hidden_states)
+        hidden_states = self.nonlinearity(hidden_states)
+
+        hidden_states = self.conv1(hidden_states)
+
+        hidden_states = self.norm2(hidden_states)
+
+        hidden_states = self.nonlinearity(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+        hidden_states = self.conv2(hidden_states)
+
+        if self.conv_shortcut is not None:
+            input_tensor = self.conv_shortcut(input_tensor)
+
+        output_tensor = input_tensor + hidden_states
+
+        return output_tensor
+
+class Downsample2D(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(Downsample2D, self).__init__()
+        self.conv = nn.Conv2d(
+            in_channels, out_channels, kernel_size=3, stride=2, padding=1
+        )
+
+    def forward(self, x):
+        return self.conv(x)
 
 class LatentDownscaler(LightningModule):
     def __init__(self,
@@ -27,7 +116,8 @@ class LatentDownscaler(LightningModule):
                  output_channels: int = 4,
                  hidden_channels: int = 64,
                  num_layers: int = 6,
-                 lr: float = 0.0002,
+                 lr_adamw: float = 0.0002,
+                 lr_muon: float = 0.02,
                  b1: float = 0.5,
                  b2: float = 0.999,
                  weight_decay: float = 0,
@@ -39,6 +129,12 @@ class LatentDownscaler(LightningModule):
                  cosine_scheduler: bool = False,
                  max_steps: int = -1,
                  use_resizing: bool = False,
+                 datapoints_per_epoch: int = None,
+                 max_epochs: int = None,
+                 use_resnet: bool = False,
+                 use_attention: bool = False,
+                 simple: bool = False,
+                 gradient_clip_val: float = 0.0,
                  **kwargs):
         super().__init__()
         self.save_hyperparameters()
@@ -52,8 +148,14 @@ class LatentDownscaler(LightningModule):
         self.val_url = val_url
         
         self.cosine_scheduler = cosine_scheduler
+        self.datapoints_per_epoch = datapoints_per_epoch
         self.max_steps = max_steps
-        self.lr = lr
+        self.max_epochs = max_epochs
+        self.batch_size = batch_size
+        if self.datapoints_per_epoch is not None:
+            self.max_steps = self.max_epochs * self.datapoints_per_epoch // self.batch_size 
+        self.lr_adamw = lr_adamw
+        self.lr_muon = lr_muon
         self.b1 = b1
         self.b2 = b2
         self.weight_decay = weight_decay
@@ -61,10 +163,23 @@ class LatentDownscaler(LightningModule):
         self.num_workers = num_workers
         self.log_every_n_steps = log_every_n_steps
         self.use_resizing = use_resizing
+        self.scheduler = None
+        self.optimizer = None
+        self.use_resnet = use_resnet
+        self.use_attention = use_attention
+        self.automatic_optimization = False
+        self.gradient_clip_val = gradient_clip_val
+        self.simple = simple
         # Build the model
-        self.build_model()
+        if self.use_resnet:
+            self.build_resnet_model()
+        if self.use_resnet and self.simple:
+            self.build_simple_resnet_model()
+        else:
+            self.build_convnet_model()
         
-    def build_model(self):
+
+    def build_convnet_model(self):
         # Create a 6-layer CNN for downscaling
         layers = []
         
@@ -79,8 +194,11 @@ class LatentDownscaler(LightningModule):
 
         layers.append(nn.Conv2d(self.hidden_channels, self.hidden_channels, kernel_size=3, padding=1, stride=2))
         layers.append(nn.LeakyReLU(0.2, inplace=True))
-        
-        for _ in range((self.num_layers - 2)//2):
+        n_small = (self.num_layers - 2)//2
+        if self.use_attention:
+            layers.append(AttentionBlock(self.hidden_channels))
+            n_small -= 1
+        for _ in range(n_small):
             layers.append(nn.Conv2d(self.hidden_channels, self.hidden_channels, kernel_size=3, padding=1))
             layers.append(nn.LeakyReLU(0.2, inplace=True))
         
@@ -89,7 +207,64 @@ class LatentDownscaler(LightningModule):
         
         # Create the model
         self.model = nn.Sequential(*layers)
+    
+
+    def build_simple_resnet_model(self):
+        # Create a 6-layer CNN for downscaling
+        layers = []
         
+        # First layer: input_channels -> hidden_channels
+        layers.append(nn.Conv2d(self.input_channels, self.hidden_channels, kernel_size=3, padding=1))
+        layers.append(nn.LeakyReLU(0.2, inplace=True))
+        
+        # Middle layers: hidden_channels -> hidden_channels
+        for _ in range((self.num_layers - 2)//2 - 1):
+            layers.append(SimpleResnetBlock2D(self.hidden_channels))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+
+        layers.append(nn.Conv2d(self.hidden_channels, self.hidden_channels, kernel_size=3, padding=1, stride=2))
+        layers.append(nn.LeakyReLU(0.2, inplace=True))
+        n_small = (self.num_layers - 2)//2
+        if self.use_attention:
+            layers.append(AttentionBlock(self.hidden_channels))
+            n_small -= 1
+        for _ in range(n_small):
+            layers.append(SimpleResnetBlock2D(self.hidden_channels))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+        
+        # Final layer: hidden_channels -> output_channels
+        layers.append(nn.Conv2d(self.hidden_channels, self.output_channels, kernel_size=3, padding=1))
+        
+        # Create the model
+        self.model = nn.Sequential(*layers)
+        
+    def build_resnet_model(self):
+        # Create a 6-layer CNN for downscaling
+        layers = []
+        # upscale to hidden_channels
+        layers.append(nn.Conv2d(self.input_channels, self.hidden_channels, kernel_size=3, stride=1, padding=1))
+        
+        # Middle layers: hidden_channels -> hidden_channels
+        for _ in range((self.num_layers - 2)//2 - 1):
+            layers.append(ResnetBlock2D(self.hidden_channels, self.hidden_channels, conv_shortcut=False))
+
+        layers.append(Downsample2D(self.hidden_channels, self.hidden_channels))
+        
+        n_small = (self.num_layers - 2)//2
+        if self.use_attention:
+            layers.append(AttentionBlock(self.hidden_channels))
+            n_small -= 1
+        for _ in range(n_small):
+            layers.append(ResnetBlock2D(self.hidden_channels, self.hidden_channels, conv_shortcut=False))
+        
+        # Final layer: hidden_channels -> output_channels
+        layers.append(nn.GroupNorm(32, self.hidden_channels, eps=1e-05, affine=True))
+        layers.append(nn.SiLU())
+        layers.append(nn.Conv2d(self.hidden_channels, self.output_channels, kernel_size=3, stride=1, padding=1))
+        
+        # Create the model
+        self.model = nn.Sequential(*layers)
+
     def forward(self, x):
         # Input: [B, C, 128, 128]
         if self.use_resizing:
@@ -98,7 +273,7 @@ class LatentDownscaler(LightningModule):
         else:
             return self.model(x)
 
-    def training_step(self, batch, batch_idx):
+    def training_step(self, batch, batch_idx):            
         large_latents, small_latents = batch
         # Forward pass
         predicted_small_latents = self(large_latents)
@@ -107,10 +282,10 @@ class LatentDownscaler(LightningModule):
         loss = F.mse_loss(predicted_small_latents, small_latents)
         
         # Log metrics
-        current_lr = self.trainer.optimizers[0].param_groups[0]['lr']
-        self.log("learning_rate", current_lr)
         self.log('epoch', float(self.current_epoch), on_step=True, on_epoch=True)
         self.log('loss', loss.item(), on_step=True, on_epoch=True)
+        self.log('lr-adamw', self.adamw.param_groups[0]['lr'], on_step=True, on_epoch=True)
+        self.log('lr-muon', self.muon.param_groups[0]['lr'], on_step=True, on_epoch=True)
 
         # Calculate and log additional metrics
         if self.trainer.global_step % self.trainer.log_every_n_steps == 0:
@@ -125,15 +300,22 @@ class LatentDownscaler(LightningModule):
                 'targets': wandb.Histogram(small_latents.detach().cpu())
             })
             
-            # Log gradient norm
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=2, norm_type=2)
-            self.log("grad_norm", grad_norm)
             
             # Log parameter gradients
             for name, param in self.named_parameters():
                 if param.grad is not None:
                     self.logger.experiment.log({f"grad_{name}": wandb.Histogram(param.grad.detach().cpu())})
-
+        self.manual_backward(loss)
+        # Log gradient norm
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.gradient_clip_val, norm_type=2)
+        self.log("grad_norm", grad_norm)
+        self.muon.step()
+        self.muon.zero_grad()
+        adamw = self.optimizers()
+        adamw.step()
+        adamw.zero_grad()
+        #self.log("global_step_train", self.global_step)
+        #print(f"global_step_train: {self.global_step}")
         return loss
     
     def validation_step(self, batch, batch_idx):
@@ -151,29 +333,48 @@ class LatentDownscaler(LightningModule):
         # Log metrics
         self.log('val_loss', loss.item(), on_step=True, on_epoch=True)
         self.log('val_psnr', psnr.item(), on_step=True, on_epoch=True)
-        
+        x = large_latents
+        helper = transforms.Resize((x.shape[2]//2, x.shape[3]//2), interpolation=transforms.InterpolationMode.NEAREST_EXACT)
+        helper_bilinear = transforms.Resize((x.shape[2]//2, x.shape[3]//2), interpolation=transforms.InterpolationMode.BILINEAR)
+        helper_bicubic = transforms.Resize((x.shape[2]//2, x.shape[3]//2), interpolation=transforms.InterpolationMode.BICUBIC)
+        baseline_mean = F.avg_pool2d(large_latents, kernel_size=2)
+        self.log('baseline_nearest_exact', F.mse_loss(helper(large_latents), small_latents), on_step=True, on_epoch=True)
+        self.log('baseline_zeros', F.mse_loss(torch.zeros_like(small_latents), small_latents), on_step=True, on_epoch=True)
+        self.log('baseline_bilinear', F.mse_loss(helper_bilinear(large_latents), small_latents), on_step=True, on_epoch=True)
+        self.log('baseline_bicubic', F.mse_loss(helper_bicubic(large_latents), small_latents), on_step=True, on_epoch=True)
+        self.log('baseline_mean', F.mse_loss(baseline_mean, small_latents), on_step=True, on_epoch=True)
+        #self.log("global_step_val", self.global_step)
+        #print(f"global_step_val: {self.global_step}")
         return loss
        
     def configure_optimizers(self):
-        lr = self.lr
+        lr_adamw = self.lr_adamw
+        lr_muon = self.lr_muon
         b1 = self.b1
         b2 = self.b2
         weight_decay = self.weight_decay
-        
-        opt = torch.optim.AdamW(self.parameters(), lr=lr, betas=(b1, b2), weight_decay=weight_decay)
+
+        # Find ≥2D parameters in the body of the network -- these should be optimized by Muon
+        muon_params = [p for p in self.parameters() if p.ndim >= 2]
+        # Find everything else -- these should be optimized by AdamW
+        adamw_params = [p for p in self.parameters() if p.ndim < 2]
+        # Create the optimizer
+        self.muon = Muon(muon_params, lr=lr_muon, momentum=0.95, rank=0, world_size=1)
+        self.adamw = torch.optim.AdamW(adamw_params, lr=lr_adamw, betas=(b1, b2), weight_decay=weight_decay)
         
         if self.cosine_scheduler:
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizers[1], T_max=self.max_steps)
             return {
-                "optimizer": opt,
+                "optimizer": self.adamw,
                 "lr_scheduler": {
-                    "scheduler": torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=self.max_steps),
+                    "scheduler": self.scheduler,
                     "interval": "step"
                 }
             }
         else:
-            return opt
+            return self.adamw
     
-    def url_to_dataloader(self, url):
+    def url_to_dataloader(self, url, train=True):
         def log_and_continue(exn):
             """Call in an exception handler to ignore any exception, issue a warning, and continue."""
             logging.warning(f'Handling webdataset error ({repr(exn)}). Ignoring.')
@@ -199,13 +400,15 @@ class LatentDownscaler(LightningModule):
         loader = wds.WebLoader(
             dataset, batch_size=None, shuffle=False, num_workers=self.num_workers,
         )
+        if self.datapoints_per_epoch is not None and train:
+            loader = loader.with_epoch(self.datapoints_per_epoch//self.batch_size)
         return loader
 
     def train_dataloader(self):
-        return self.url_to_dataloader(self.train_url)
+        return self.url_to_dataloader(self.train_url, train=True)
 
     def val_dataloader(self):
-        return self.url_to_dataloader(self.val_url)
+        return self.url_to_dataloader(self.val_url, train=False)
     
 
 def main(args: Namespace) -> None:
@@ -224,10 +427,11 @@ def main(args: Namespace) -> None:
     
     if args.devices is not None:
         trainer = Trainer(max_epochs=args.max_epochs, max_steps=args.max_steps, accelerator=args.accelerator, devices=args.devices, 
-                        strategy=args.strategy, gradient_clip_val=args.gradient_clip_val, log_every_n_steps=args.log_every_n_steps)
+                        strategy=args.strategy, log_every_n_steps=args.log_every_n_steps,
+                        val_check_interval=args.checkpoint_every_n_examples//(args.batch_size))
     else:
-        trainer = Trainer(max_epochs=args.max_epochs, max_steps=args.max_steps, accelerator=args.accelerator, strategy=args.strategy,
-                        gradient_clip_val=args.gradient_clip_val, log_every_n_steps=args.log_every_n_steps)
+        trainer = Trainer(max_epochs=args.max_epochs, max_steps=args.max_steps, accelerator=args.accelerator, strategy=args.strategy, 
+                          log_every_n_steps=args.log_every_n_steps, val_check_interval=args.checkpoint_every_n_examples//(args.batch_size))
 
     if trainer.is_global_zero:
         # Wandb logging
@@ -235,7 +439,8 @@ def main(args: Namespace) -> None:
         wandb_logger = WandbLogger(project=args.wandb_project, 
                                 log_model=False, 
                                 save_dir=args.checkpoint_path,
-                                config=vars(args))
+                                config=vars(args),
+                                name=args.experiment_name)
         run_name = wandb_logger.experiment.name
 
         # Configure the ModelCheckpoint callback
@@ -247,8 +452,9 @@ def main(args: Namespace) -> None:
             mode='min',  # Mode of the monitored quantity
             every_n_train_steps=args.checkpoint_every_n_examples//(args.batch_size * trainer.world_size),
         )
-
+        lr_monitor = LearningRateMonitor(logging_interval='step')
         trainer.callbacks.append(checkpoint_callback)
+        trainer.callbacks.append(lr_monitor)
         trainer.logger = wandb_logger
 
 
@@ -271,23 +477,25 @@ if __name__ == '__main__':
     parser.add_argument("--val_url", type=str, default='/share/datasets/datasets/laicoyo_latent_pairs/{000081..000090}.tar')
     
     # training parameters
-    parser.add_argument("--gradient_clip_val", type=float, default=1.0)
+    parser.add_argument("--gradient_clip_val", type=float, default=0.0)
     parser.add_argument("--cosine_scheduler", default=False, action="store_true")
     parser.add_argument("--batch_size", type=int, default=64, help="size of the batches")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_epochs", type=int, default=10, help="number of epochs of training")
     parser.add_argument("--max_steps", type=int, default=-1, help="number of steps of training")
-    parser.add_argument("--lr", type=float, default=0.0002, help="adam: learning rate")
+    parser.add_argument("--lr_adamw", type=float, default=0.0002, help="adam: learning rate")
+    parser.add_argument("--lr_muon", type=float, default=0.02, help="muon: learning rate")
     parser.add_argument("--b1", type=float, default=0.5,
                         help="adam: decay of first order momentum of gradient")
     parser.add_argument("--b2", type=float, default=0.999,
                         help="adam: decay of first order momentum of gradient")
     parser.add_argument("--weight_decay", type=float, default=0.0001, help="weight decay for optimizer")
+    parser.add_argument("--datapoints_per_epoch", type=int, default=None, help="number of data points per epoch")
     
     # checkpoint and logging parameters
     parser.add_argument("--checkpoint_path", type=str, default="models/latent_downscaler")
     parser.add_argument("--log_every_n_steps", type=int, default=100)
-    parser.add_argument("--checkpoint_every_n_examples", type=int, default=50000)
+    parser.add_argument("--checkpoint_every_n_examples", type=int, default=100000)
     parser.add_argument("--checkpoint_top_k", type=int, default=5)
     
     # hardware parameters
@@ -299,6 +507,10 @@ if __name__ == '__main__':
     parser.add_argument("--wandb_project", type=str, default="latent_downscaler")
     parser.add_argument("--wandb_dir", type=str, default=".")
     parser.add_argument("--use_resizing", default=False, action="store_true")
+    parser.add_argument("--experiment_name", type=str, default=None, help="optional name for the experiment")
+    parser.add_argument("--use_resnet", default=False, action="store_true")
+    parser.add_argument("--use_attention", default=False, action="store_true")
+    parser.add_argument("--simple", default=False, action="store_true")
     
     hparams = parser.parse_args()
 
