@@ -58,14 +58,25 @@ class SimpleResnetBlock2D(nn.Module):
         super(SimpleResnetBlock2D, self).__init__()
         self.conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(in_channels)
-        self.relu = nn.LeakyReLU(0.2, inplace=True)
+        self.leaky_relu1 = nn.LeakyReLU(0.2, inplace=True)
+        self.conv2 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(in_channels)
+        self.leaky_relu2 = nn.LeakyReLU(0.2, inplace=True)
         
     def forward(self, x):
         residual = x
+        
         out = self.conv1(x)
         out = self.bn1(out)
-        out = self.relu(out)  # Optional: sometimes activation is after addition
-        return out + residual
+        out = self.leaky_relu1(out)
+        
+        out = self.conv2(out)
+        out = self.bn2(out)
+        
+        out += residual
+        out = self.leaky_relu2(out)
+        
+        return out
 
 
 class ResnetBlock2D(nn.Module):
@@ -225,19 +236,14 @@ class LatentDownscaler(LightningModule):
         layers.append(nn.LeakyReLU(0.2, inplace=True))
         
         # Middle layers: hidden_channels -> hidden_channels
-        for _ in range((self.num_layers - 2)//2 - 1):
+        for _ in range((self.num_layers - 2)//2):
             layers.append(SimpleResnetBlock2D(self.hidden_channels))
-            layers.append(nn.LeakyReLU(0.2, inplace=True))
 
         layers.append(nn.Conv2d(self.hidden_channels, self.hidden_channels, kernel_size=3, padding=1, stride=2))
         layers.append(nn.LeakyReLU(0.2, inplace=True))
         n_small = (self.num_layers - 2)//2
-        if self.use_attention:
-            layers.append(AttentionBlock(self.hidden_channels))
-            n_small -= 1
         for _ in range(n_small):
             layers.append(SimpleResnetBlock2D(self.hidden_channels))
-            layers.append(nn.LeakyReLU(0.2, inplace=True))
         
         # Final layer: hidden_channels -> output_channels
         layers.append(nn.Conv2d(self.hidden_channels, self.output_channels, kernel_size=3, padding=1))
