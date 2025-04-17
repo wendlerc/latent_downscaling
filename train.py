@@ -52,13 +52,20 @@ class AttentionBlock(nn.Module):
         feature_map = feature_map_.reshape(x.shape[0], -1, x.shape[2], x.shape[3])
         return feature_map + x
 
+    
 class SimpleResnetBlock2D(nn.Module):
     def __init__(self, in_channels):
         super(SimpleResnetBlock2D, self).__init__()
         self.conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
-
+        self.bn1 = nn.BatchNorm2d(in_channels)
+        self.relu = nn.LeakyReLU(0.2, inplace=True)
+        
     def forward(self, x):
-        return x + self.conv1(x)
+        residual = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)  # Optional: sometimes activation is after addition
+        return out + residual
 
 
 class ResnetBlock2D(nn.Module):
@@ -237,7 +244,8 @@ class LatentDownscaler(LightningModule):
         
         # Create the model
         self.model = nn.Sequential(*layers)
-        
+
+
     def build_resnet_model(self):
         # Create a 6-layer CNN for downscaling
         layers = []
@@ -511,6 +519,7 @@ if __name__ == '__main__':
     parser.add_argument("--use_resnet", default=False, action="store_true")
     parser.add_argument("--use_attention", default=False, action="store_true")
     parser.add_argument("--simple", default=False, action="store_true")
+    parser.add_argument("--bn", default=False, action="store_true")
     
     hparams = parser.parse_args()
 
