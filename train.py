@@ -15,6 +15,7 @@ from pytorch_lightning.trainer import Trainer
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from torchvision import transforms
+from PIL import Image
 
 import logging
 import wandb
@@ -22,6 +23,43 @@ import json
 
 from muon import Muon
 from torch import nn
+
+
+def tensor_to_pil(tensor):
+    """Convert a PyTorch tensor to a PIL Image.
+    
+    Args:
+        tensor (torch.Tensor): Input tensor of shape [C, H, W] or [B, C, H, W]
+        
+    Returns:
+        PIL.Image: The converted PIL Image
+    """
+    if tensor.ndim == 4:
+        # If batch dimension exists, take first image
+        tensor = tensor[0]
+    
+    # Move to CPU if on GPU
+    tensor = tensor.cpu()
+    
+    # Normalize to [0, 1] range if not already
+    if tensor.min() < 0 or tensor.max() > 1:
+        tensor = (tensor - tensor.min()) / (tensor.max() - tensor.min())
+    
+    # Convert to numpy array and transpose to [H, W, C]
+    np_array = tensor.numpy().transpose(1, 2, 0)
+    
+    # Convert to uint8 [0, 255] range
+    np_array = (np_array * 255).astype(np.uint8)
+    
+    # Handle different channel dimensions
+    if np_array.shape[2] == 1:  # Single channel
+        return Image.fromarray(np_array[:, :, 0], mode='L')
+    elif np_array.shape[2] == 3:  # RGB
+        return Image.fromarray(np_array, mode='RGB')
+    elif np_array.shape[2] == 4:  # RGBA
+        return Image.fromarray(np_array, mode='RGBA')
+    else:
+        raise ValueError(f"Unsupported number of channels: {np_array.shape[2]}")
 
 
 class EMA:
@@ -405,13 +443,11 @@ class LatentDownscaler(LightningModule):
         helper = transforms.Resize((x.shape[2]//2, x.shape[3]//2), interpolation=transforms.InterpolationMode.NEAREST_EXACT)
         helper_bilinear = transforms.Resize((x.shape[2]//2, x.shape[3]//2), interpolation=transforms.InterpolationMode.BILINEAR)
         helper_bicubic = transforms.Resize((x.shape[2]//2, x.shape[3]//2), interpolation=transforms.InterpolationMode.BICUBIC)
-        helper_lanczos = transforms.Resize((x.shape[2]//2, x.shape[3]//2), interpolation=transforms.InterpolationMode.LANCZOS)
         baseline_mean = F.avg_pool2d(large_latents, kernel_size=2)
         self.log('baseline_nearest_exact', F.mse_loss(helper(large_latents), small_latents), on_step=True, on_epoch=True)
         self.log('baseline_zeros', F.mse_loss(torch.zeros_like(small_latents), small_latents), on_step=True, on_epoch=True)
         self.log('baseline_bilinear', F.mse_loss(helper_bilinear(large_latents), small_latents), on_step=True, on_epoch=True)
         self.log('baseline_bicubic', F.mse_loss(helper_bicubic(large_latents), small_latents), on_step=True, on_epoch=True)
-        self.log('baseline_lanczos', F.mse_loss(helper_lanczos(large_latents), small_latents), on_step=True, on_epoch=True)
         self.log('baseline_mean', F.mse_loss(baseline_mean, small_latents), on_step=True, on_epoch=True)
         
         # Restore original weights after validation if EMA is enabled
