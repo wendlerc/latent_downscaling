@@ -24,6 +24,41 @@ from muon import Muon
 from torch import nn
 
 
+class EMA:
+    def __init__(self, model, decay=0.9999):
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        self.register()
+
+    def register(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    def update(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                new_average = self.decay * self.shadow[name] + (1.0 - self.decay) * param.data
+                self.shadow[name] = new_average.clone()
+
+    def apply_shadow(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                self.backup[name] = param.data
+                param.data = self.shadow[name]
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.backup
+                param.data = self.backup[name]
+        self.backup = {}
+
+
 class AttentionBlock(nn.Module):
     def __init__(self, in_channels, patch_size=8, num_heads=16):
         super(AttentionBlock, self).__init__()
@@ -153,6 +188,8 @@ class LatentDownscaler(LightningModule):
                  use_attention: bool = False,
                  simple: bool = False,
                  gradient_clip_val: float = 0.0,
+                 use_ema: bool = False,
+                 ema_decay: float = 0.9999,
                  **kwargs):
         super().__init__()
         self.save_hyperparameters()
@@ -188,6 +225,8 @@ class LatentDownscaler(LightningModule):
         self.automatic_optimization = False
         self.gradient_clip_val = gradient_clip_val
         self.simple = simple
+        self.use_ema = use_ema
+        self.ema_decay = ema_decay
         # Build the model
         if self.use_resnet:
             self.build_resnet_model()
@@ -196,6 +235,9 @@ class LatentDownscaler(LightningModule):
         else:
             self.build_convnet_model()
         
+        # Initialize EMA if enabled
+        if self.use_ema:
+            self.ema = EMA(self.model, decay=self.ema_decay)
 
     def build_convnet_model(self):
         # Create a 6-layer CNN for downscaling
@@ -328,12 +370,20 @@ class LatentDownscaler(LightningModule):
         adamw = self.optimizers()
         adamw.step()
         adamw.zero_grad()
-        #self.log("global_step_train", self.global_step)
-        #print(f"global_step_train: {self.global_step}")
+        
+        # Update EMA after optimizer step if enabled
+        if self.use_ema:
+            self.ema.update()
+        
         return loss
     
     def validation_step(self, batch, batch_idx):
         large_latents, small_latents = batch
+        
+        # Apply EMA shadow weights for validation if enabled
+        if self.use_ema:
+            self.ema.apply_shadow()
+        
         # Forward pass
         predicted_small_latents = self(large_latents)
         
@@ -357,9 +407,24 @@ class LatentDownscaler(LightningModule):
         self.log('baseline_bilinear', F.mse_loss(helper_bilinear(large_latents), small_latents), on_step=True, on_epoch=True)
         self.log('baseline_bicubic', F.mse_loss(helper_bicubic(large_latents), small_latents), on_step=True, on_epoch=True)
         self.log('baseline_mean', F.mse_loss(baseline_mean, small_latents), on_step=True, on_epoch=True)
-        #self.log("global_step_val", self.global_step)
-        #print(f"global_step_val: {self.global_step}")
+        
+        # Restore original weights after validation if EMA is enabled
+        if self.use_ema:
+            self.ema.restore()
+        
         return loss
+    
+    def on_save_checkpoint(self, checkpoint):
+        # Apply EMA shadow weights before saving checkpoint if enabled
+        if self.use_ema:
+            self.ema.apply_shadow()
+        # The model state will be saved with EMA weights if enabled
+    
+    def on_load_checkpoint(self, checkpoint):
+        # If EMA is enabled, re-initialize EMA with the loaded model
+        if self.use_ema:
+            self.ema = EMA(self.model, decay=self.ema_decay)
+            self.ema.register()
        
     def configure_optimizers(self):
         lr_adamw = self.lr_adamw
@@ -505,6 +570,8 @@ if __name__ == '__main__':
                         help="adam: decay of first order momentum of gradient")
     parser.add_argument("--weight_decay", type=float, default=0.0001, help="weight decay for optimizer")
     parser.add_argument("--datapoints_per_epoch", type=int, default=None, help="number of data points per epoch")
+    parser.add_argument("--use_ema", default=False, action="store_true", help="use exponential moving average")
+    parser.add_argument("--ema_decay", type=float, default=0.9999, help="decay rate for exponential moving average")
     
     # checkpoint and logging parameters
     parser.add_argument("--checkpoint_path", type=str, default="models/latent_downscaler")
