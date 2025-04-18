@@ -24,77 +24,7 @@ import json
 from muon import Muon
 from torch import nn
 
-
-def tensor_to_pil(tensor):
-    """Convert a PyTorch tensor to a PIL Image.
-    
-    Args:
-        tensor (torch.Tensor): Input tensor of shape [C, H, W] or [B, C, H, W]
-        
-    Returns:
-        PIL.Image: The converted PIL Image
-    """
-    if tensor.ndim == 4:
-        # If batch dimension exists, take first image
-        tensor = tensor[0]
-    
-    # Move to CPU if on GPU
-    tensor = tensor.cpu()
-    
-    # Normalize to [0, 1] range if not already
-    if tensor.min() < 0 or tensor.max() > 1:
-        tensor = (tensor - tensor.min()) / (tensor.max() - tensor.min())
-    
-    # Convert to numpy array and transpose to [H, W, C]
-    np_array = tensor.numpy().transpose(1, 2, 0)
-    
-    # Convert to uint8 [0, 255] range
-    np_array = (np_array * 255).astype(np.uint8)
-    
-    # Handle different channel dimensions
-    if np_array.shape[2] == 1:  # Single channel
-        return Image.fromarray(np_array[:, :, 0], mode='L')
-    elif np_array.shape[2] == 3:  # RGB
-        return Image.fromarray(np_array, mode='RGB')
-    elif np_array.shape[2] == 4:  # RGBA
-        return Image.fromarray(np_array, mode='RGBA')
-    else:
-        raise ValueError(f"Unsupported number of channels: {np_array.shape[2]}")
-
-
-class EMA:
-    def __init__(self, model, decay=0.9999):
-        self.model = model
-        self.decay = decay
-        self.shadow = {}
-        self.backup = {}
-        self.register()
-
-    def register(self):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.data.clone()
-
-    def update(self):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                assert name in self.shadow
-                new_average = self.decay * self.shadow[name] + (1.0 - self.decay) * param.data
-                self.shadow[name] = new_average.clone()
-
-    def apply_shadow(self):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                assert name in self.shadow
-                self.backup[name] = param.data
-                param.data = self.shadow[name]
-
-    def restore(self):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                assert name in self.backup
-                param.data = self.backup[name]
-        self.backup = {}
+from ema_pytorch import EMA
 
 
 class AttentionBlock(nn.Module):
@@ -227,7 +157,7 @@ class LatentDownscaler(LightningModule):
                  simple: bool = False,
                  gradient_clip_val: float = 0.0,
                  use_ema: bool = False,
-                 ema_decay: float = 0.9999,
+                 ema_decay: float = 0.999,
                  **kwargs):
         super().__init__()
         self.save_hyperparameters()
@@ -279,7 +209,13 @@ class LatentDownscaler(LightningModule):
         
         # Initialize EMA if enabled
         if self.use_ema:
-            self.ema = EMA(self.model, decay=self.ema_decay)
+            self.ema = EMA(
+                    self.model,
+                    beta = self.ema_decay,              # exponential moving average factor
+                    update_after_step = 1000,    # only after this number of .update() calls will it start updating
+                    update_every = 10,          # how often to actually update, to save on compute (updates every 10th .update() call)
+                )
+
 
     def build_convnet_model(self):
         # Create a 6-layer CNN for downscaling
@@ -405,7 +341,7 @@ class LatentDownscaler(LightningModule):
                     self.logger.experiment.log({f"grad_{name}": wandb.Histogram(param.grad.detach().cpu())})
         self.manual_backward(loss)
         # Log gradient norm
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.gradient_clip_val, norm_type=2)
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.gradient_clip_val, norm_type=2)
         self.log("grad_norm", grad_norm)
         self.muon.step()
         self.muon.zero_grad()
@@ -424,10 +360,12 @@ class LatentDownscaler(LightningModule):
         
         # Apply EMA shadow weights for validation if enabled
         if self.use_ema:
-            self.ema.apply_shadow()
+            model = self.ema
+        else:
+            model = self.model
         
         # Forward pass
-        predicted_small_latents = self(large_latents)
+        predicted_small_latents = model(large_latents)
         
         # Calculate loss (MSE)
         loss = F.mse_loss(predicted_small_latents, small_latents)
@@ -450,24 +388,9 @@ class LatentDownscaler(LightningModule):
         self.log('baseline_bicubic', F.mse_loss(helper_bicubic(large_latents), small_latents), on_step=True, on_epoch=True)
         self.log('baseline_mean', F.mse_loss(baseline_mean, small_latents), on_step=True, on_epoch=True)
         
-        # Restore original weights after validation if EMA is enabled
-        if self.use_ema:
-            self.ema.restore()
-        
         return loss
     
-    def on_save_checkpoint(self, checkpoint):
-        # Apply EMA shadow weights before saving checkpoint if enabled
-        if self.use_ema:
-            self.ema.apply_shadow()
-        # The model state will be saved with EMA weights if enabled
-    
-    def on_load_checkpoint(self, checkpoint):
-        # If EMA is enabled, re-initialize EMA with the loaded model
-        if self.use_ema:
-            self.ema = EMA(self.model, decay=self.ema_decay)
-            self.ema.register()
-       
+     
     def configure_optimizers(self):
         lr_adamw = self.lr_adamw
         lr_muon = self.lr_muon
@@ -476,9 +399,9 @@ class LatentDownscaler(LightningModule):
         weight_decay = self.weight_decay
 
         # Find ≥2D parameters in the body of the network -- these should be optimized by Muon
-        muon_params = [p for p in self.parameters() if p.ndim >= 2]
+        muon_params = [p for p in self.model.parameters() if p.ndim >= 2]
         # Find everything else -- these should be optimized by AdamW
-        adamw_params = [p for p in self.parameters() if p.ndim < 2]
+        adamw_params = [p for p in self.model.parameters() if p.ndim < 2]
         # Create the optimizer
         self.muon = Muon(muon_params, lr=lr_muon, momentum=0.95, rank=0, world_size=1)
         self.adamw = torch.optim.AdamW(adamw_params, lr=lr_adamw, betas=(b1, b2), weight_decay=weight_decay)
