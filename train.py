@@ -405,11 +405,13 @@ class LatentDownscaler(LightningModule):
         helper = transforms.Resize((x.shape[2]//2, x.shape[3]//2), interpolation=transforms.InterpolationMode.NEAREST_EXACT)
         helper_bilinear = transforms.Resize((x.shape[2]//2, x.shape[3]//2), interpolation=transforms.InterpolationMode.BILINEAR)
         helper_bicubic = transforms.Resize((x.shape[2]//2, x.shape[3]//2), interpolation=transforms.InterpolationMode.BICUBIC)
+        helper_lanczos = transforms.Resize((x.shape[2]//2, x.shape[3]//2), interpolation=transforms.InterpolationMode.LANCZOS)
         baseline_mean = F.avg_pool2d(large_latents, kernel_size=2)
         self.log('baseline_nearest_exact', F.mse_loss(helper(large_latents), small_latents), on_step=True, on_epoch=True)
         self.log('baseline_zeros', F.mse_loss(torch.zeros_like(small_latents), small_latents), on_step=True, on_epoch=True)
         self.log('baseline_bilinear', F.mse_loss(helper_bilinear(large_latents), small_latents), on_step=True, on_epoch=True)
         self.log('baseline_bicubic', F.mse_loss(helper_bicubic(large_latents), small_latents), on_step=True, on_epoch=True)
+        self.log('baseline_lanczos', F.mse_loss(helper_lanczos(large_latents), small_latents), on_step=True, on_epoch=True)
         self.log('baseline_mean', F.mse_loss(baseline_mean, small_latents), on_step=True, on_epoch=True)
         
         # Restore original weights after validation if EMA is enabled
@@ -446,7 +448,7 @@ class LatentDownscaler(LightningModule):
         self.adamw = torch.optim.AdamW(adamw_params, lr=lr_adamw, betas=(b1, b2), weight_decay=weight_decay)
         
         if self.cosine_scheduler:
-            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizers[1], T_max=self.max_steps)
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.adamw, T_max=self.max_steps)
             return {
                 "optimizer": self.adamw,
                 "lr_scheduler": {
@@ -533,7 +535,7 @@ def main(args: Namespace) -> None:
             verbose=True,  # If you want to see a message for each checkpoint
             monitor='val_loss',  # Quantity to monitor
             mode='min',  # Mode of the monitored quantity
-            every_n_train_steps=args.checkpoint_every_n_examples//(args.batch_size * trainer.world_size),
+            every_n_train_steps=args.checkpoint_every_n_examples//(args.batch_size * trainer.world_size)+1,
         )
         lr_monitor = LearningRateMonitor(logging_interval='step')
         trainer.callbacks.append(checkpoint_callback)
