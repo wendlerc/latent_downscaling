@@ -228,12 +228,16 @@ class LatentDownscaler(LightningModule):
         self.use_ema = use_ema
         self.ema_decay = ema_decay
         # Build the model
-        if self.use_resnet:
-            self.build_resnet_model()
         if self.use_resnet and self.simple:
             self.build_simple_resnet_model()
+        elif self.use_resnet:
+            self.build_resnet_model()
         else:
             self.build_convnet_model()
+        
+        # Move model to GPU if available
+        if torch.cuda.is_available():
+            self.model = self.model.cuda()
         
         # Initialize EMA if enabled
         if self.use_ema:
